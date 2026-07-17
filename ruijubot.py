@@ -5,12 +5,14 @@ import cv2
 import ddddocr
 import numpy as np
 from datetime import datetime, timedelta, timezone
+from asyncio import Semaphore
 
 # ==================== CONFIGURATION ====================
 BOT_TOKEN = '8957948839:AAHykLpPF3KxXSsabWYBZGxfa9sVyPvvoek'
 ADMIN_ID = "7074774446"
-CONCURRENCY = 1000
-BATCH_SIZE = 1000
+CONCURRENCY = 80    # Concurrent requests ကိုလျှော့ထားပါ
+BATCH_SIZE = 80     # Batch size ကိုလျှော့ထားပါ
+MAX_SPEED = 2000    # အများဆုံး Speed (codes/min) - 2000 ထားပါ
 # =======================================================
 
 bot = AsyncTeleBot(BOT_TOKEN)
@@ -23,18 +25,38 @@ success_texts = {}
 limited_messages = {}
 limited_texts = {}
 captcha_state = {}
+auth_list = {}
+results = {}
 
-# Global Message Locks to prevent concurrent API update crashes
 message_locks = {}
 progress_timers = {}
 session = None
 _connector = None
 _voucher_sem = None
 _start_time = time.monotonic()
+_global_speed_limiter = None  # Global speed limiter
 
-# Local storage for keys and results
-auth_list = {}
-results = {}
+# Speed limiter class
+class SpeedLimiter:
+    def __init__(self, max_speed):
+        self.max_speed = max_speed
+        self.tokens = max_speed
+        self.last_refill = time.monotonic()
+        self.lock = asyncio.Lock()
+    
+    async def acquire(self):
+        async with self.lock:
+            now = time.monotonic()
+            elapsed = now - self.last_refill
+            self.tokens = min(self.max_speed, self.tokens + elapsed * (self.max_speed / 60))
+            self.last_refill = now
+            
+            if self.tokens < 1:
+                wait_time = (1 - self.tokens) * 60 / self.max_speed
+                await asyncio.sleep(wait_time)
+                self.tokens = 0
+            else:
+                self.tokens -= 1
 
 def get_chat_lock(chat_id):
     if chat_id not in message_locks:
@@ -350,7 +372,6 @@ def ascii_generator(length=6):
     return "".join(random.choice(strings_2) for _ in range(length))
 
 def pattern_generator(pattern):
-    """Generate codes from pattern. '?' = random lowercase letter or digit"""
     charset = string.ascii_lowercase + string.digits
     result = []
     for ch in pattern:
@@ -409,6 +430,11 @@ def format_progress(checked, total=None, speed=0):
     )
 
 async def run_bruteforce(mode, chat_id, session_url, scan_id, message=None, progress_msg=None):
+    global _voucher_sem, _global_speed_limiter
+    
+    if _global_speed_limiter is None:
+        _global_speed_limiter = SpeedLimiter(MAX_SPEED)
+    
     try:
         code_iter = iter_codes(mode)
     except ValueError as e:
@@ -421,7 +447,6 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id, message=None, prog
     
     progress_timers[chat_id] = time.monotonic()
 
-    global _voucher_sem
     if _voucher_sem is None:
         _voucher_sem = asyncio.Semaphore(CONCURRENCY)
 
@@ -450,6 +475,7 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id, message=None, prog
                 last_key_check = time.monotonic()
 
             async def _check(code):
+                await _global_speed_limiter.acquire()
                 async with _voucher_sem:
                     return await perform_check(session_url, code, chat_id, scan_id, message=message)
 
@@ -461,6 +487,7 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id, message=None, prog
                 progress_timers[chat_id] = now_time
                 elapsed = now_time - scan_start
                 speed = (checked / elapsed * 60) if elapsed > 0 else 0
+                speed = min(speed, MAX_SPEED)
                 text = format_progress(checked, total, speed)
                 try:
                     await bot.edit_message_text(chat_id=chat_id, message_id=progress_msg.message_id, text=text)
@@ -744,6 +771,7 @@ async def start_polling():
 
 async def main():
     global session, _connector
+    
     timeout = aiohttp.ClientTimeout(total=30)
     _connector = aiohttp.TCPConnector(
         limit=2000,
